@@ -24,6 +24,11 @@ enum Settings {
         get { defaults.object(forKey: "openFullscreen") as? Bool ?? false }
         set { defaults.set(newValue, forKey: "openFullscreen") }
     }
+    /// Eigener Kagami-Schreibtisch (Vollbild-Space, per Wischen erreichbar).
+    static var kagamiSpace: Bool {
+        get { defaults.object(forKey: "kagamiSpace") as? Bool ?? true }
+        set { defaults.set(newValue, forKey: "kagamiSpace") }
+    }
     static var opacity: CGFloat {
         get { CGFloat(defaults.object(forKey: "opacity") as? Double ?? 1.0) }
         set { defaults.set(Double(newValue), forKey: "opacity") }

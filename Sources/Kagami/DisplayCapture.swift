@@ -10,6 +10,8 @@ final class DisplayCapture: NSObject, SCStreamOutput, SCStreamDelegate {
     private var displayID: CGDirectDisplayID = 0
     private var pixelSize: CGSize = .zero
     private var restarting = false
+    /// Gedrosselt (2 fps), solange niemand das Bild sieht.
+    private var throttled = false
 
     /// Neuer Frame (wird auf dem Main-Thread aufgerufen).
     var onFrame: (@MainActor (IOSurfaceRef) -> Void)?
@@ -30,6 +32,16 @@ final class DisplayCapture: NSObject, SCStreamOutput, SCStreamDelegate {
         }
     }
 
+    /// Stream drosseln, solange weder Overlay noch Kagami-Schreibtisch sichtbar sind.
+    func setThrottled(_ value: Bool) {
+        guard value != throttled else { return }
+        throttled = value
+        guard let stream else { return }
+        stream.updateConfiguration(makeConfiguration()) { error in
+            if let error { NSLog("[Kagami] updateConfiguration: \(error.localizedDescription)") }
+        }
+    }
+
     func stop() {
         let s = stream
         stream = nil
@@ -41,7 +53,7 @@ final class DisplayCapture: NSObject, SCStreamOutput, SCStreamDelegate {
         config.width = max(2, Int(pixelSize.width))
         config.height = max(2, Int(pixelSize.height))
         config.pixelFormat = kCVPixelFormatType_32BGRA
-        config.minimumFrameInterval = CMTime(value: 1, timescale: 60)
+        config.minimumFrameInterval = CMTime(value: 1, timescale: throttled ? 2 : 60)
         config.queueDepth = 5
         // Der echte Cursor bleibt über dem Overlay; im Stream würde er nur flackern.
         config.showsCursor = false

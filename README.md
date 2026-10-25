@@ -76,10 +76,18 @@ Das Icon liegt in `Resources/AppIcon.png`. Es wird beim Bauen automatisch zu `.i
 | App zurückgeben | Menüleiste › *In Kagami* › App › *Zurück auf den Hauptbildschirm* |
 | Eingabemodus | Menü › *Eingabe* (siehe unten) |
 | Deckkraft | Menü › *Deckkraft* |
+| In Kagami „hineingehen“ | mit drei Fingern zum Schreibtisch **„Kagami“** wischen (oder Menü › *Zum Kagami-Schreibtisch wechseln*) |
+| Kagami-Schreibtisch ein/aus | Menü › *Eigener Kagami-Schreibtisch (Wischen)* |
 
 ### Vollbild
 
 Fenster im nativen Vollbildmodus bleiben im Vollbild: Kagami verlässt kurz den Vollbildmodus, verschiebt das Fenster auf den Kagami-Bildschirm und schaltet dort wieder auf Vollbild. Dann füllt die App das Overlay komplett aus und läuft in einem eigenen Space auf dem virtuellen Monitor. Wenn du das Overlay größer oder kleiner ziehst, wächst das Vollbild-Fenster mit. Gibst du die App zurück, landet sie wieder im Vollbild auf dem Hauptbildschirm.
+
+### Kagami-Schreibtisch
+
+Solange Kagami läuft, gibt es auf dem Hauptbildschirm einen eigenen Vollbild-Space „Kagami“, auch wenn das Overlay ausgeblendet ist. Wischst du hinein, schaltet der virtuelle Monitor auf die Auflösung deines Bildschirms um und wird dort bildschirmfüllend angezeigt. Das Overlay ist solange ausgeblendet. Klicks, Ziehen und Scrollen laufen dort immer als echte HID-Events (wie im Modus *Kompatibel*), damit auch Browser und Electron-Apps reagieren und die Tastatur bei der angeklickten App landet. Wischst du wieder raus, kommt das Overlay in seiner alten Größe zurück.
+
+Bei Mission Control und „Schreibtisch anzeigen“ weicht das Overlay zum Bildschirmrand aus und kommt danach zurück.
 
 ### Eingabemodi
 
@@ -106,6 +114,8 @@ Sources/CGVirtualDisplayPrivate/   Header der privaten API
 Sources/Kagami/
   AppDelegate.swift      App-Start, Menüs, Verdrahtung
   OverlayPanel.swift     Overlay-Fenster + obere Leiste
+  KagamiSpace.swift      Kagami-Schreibtisch (Vollbild-Space, Eingaben)
+  ExposeWatcher.swift    Mission Control / Schreibtisch anzeigen erkennen
   StreamView.swift       Live-Bild, Maus-Events, Drag & Drop
   VirtualDisplay.swift   virtueller Monitor, Auflösung, Platzierung
   DisplayCapture.swift   ScreenCaptureKit-Stream

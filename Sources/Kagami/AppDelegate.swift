@@ -39,6 +39,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private var permissionTimer: Timer?
     private var errorMessage: String?
 
+    /// Soll das Overlay sichtbar sein (⌃⌥K / 👁)? Auf dem Kagami-Schreibtisch ist es
+    /// trotzdem ausgeblendet und kommt beim Rauswischen wieder.
+    private var overlayWanted = true
+    /// Eigener Vollbild-Space, in den man per Wischen „hineingehen“ kann.
+    private var space: KagamiSpace?
+    /// Mission Control / „Schreibtisch anzeigen“ erkennen.
+    private let expose = ExposeWatcher()
+    /// Ursprünglicher Rahmen, solange das Overlay zur Seite geschoben ist.
+    private var pushedHomeFrame: NSRect?
+    private var pushClickMonitor: Any?
+    /// Auflösung vor dem Betreten des Kagami-Schreibtischs.
+    private var sizeBeforeSpace: CGSize?
+    /// Fensterlage, die nach dem nächsten Auflösungswechsel wiederhergestellt wird.
+    private var pendingLayout: [HostManager.WindowLayout]?
+    private var dimGeneration = 0
+    private var panelMover: WindowMover!
+    /// Zuletzt aktive gehostete App – bekommt auf dem Kagami-Schreibtisch die Tastatur.
+    private var lastHostedPID: pid_t?
+
     // MARK: Lifecycle
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -50,7 +69,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         }
         SingleInstance.listen { [weak self] in
             guard let self, self.panel != nil else { return }
-            self.panel.orderFrontRegardless()
+            self.showOverlay()
         }
 
         inputForwarder.mode = Settings.inputMode
@@ -71,6 +90,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
         startVirtualDisplay()
         installCursorGuard()
+        setUpSpace()
+        expose.onChange = { [weak self] state in self?.exposeChanged(state) }
+        expose.start()
         if permissionsGranted { showLauncher() }
         updateHint()
 
@@ -81,6 +103,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        panelMover?.stop()
+        if let home = pushedHomeFrame { panel.setFrame(home, display: false) }
         host?.releaseAllImmediately()
         capture.stop()
     }
@@ -153,6 +177,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         topBar.hideButton.target = self
         topBar.hideButton.action = #selector(toggleOverlay)
 
+        panelMover = WindowMover(window: panel)
         panel.orderFrontRegardless()
         container.layoutSubtreeIfNeeded()
         updateTitle()
@@ -174,22 +199,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         }
         self.display = display
         streamView.displaySize = display.requestedPointSize
+        space?.streamView.displaySize = display.requestedPointSize
         display.onReconfigured = { [weak self] in self?.displayReconfigured() }
 
         let host = HostManager(display: display)
         host.fillWindows = Settings.fillWindows
         host.openFullscreen = Settings.openFullscreen
-        host.onActiveAppChange = { [weak self] in self?.updateTitle() }
+        host.onActiveAppChange = { [weak self] in
+            guard let self else { return }
+            if let pid = self.host?.activePID { self.lastHostedPID = pid }
+            self.updateTitle()
+        }
         host.onChange = { [weak self] in
             guard let self else { return }
             self.updateTitle()
             // Leerer Kagami-Bildschirm → Starter anbieten.
-            if self.host?.hosted.isEmpty ?? true, self.permissionsGranted { self.showLauncher() } else if !(self.host?.hosted.isEmpty ?? true) { self.hideLauncher() }
+            let empty = self.host?.hosted.isEmpty ?? true
+            if empty, self.permissionsGranted {
+                self.showLauncher()
+                self.space?.showLauncher()
+            } else if !empty {
+                self.hideLauncher()
+                self.space?.hideLauncher()
+            }
             self.updateHint()
         }
         self.host = host
 
-        capture.onFrame = { [weak self] surface in self?.streamView.display(surface: surface) }
+        capture.onFrame = { [weak self] surface in
+            self?.streamView.display(surface: surface)
+            self?.space?.streamView.display(surface: surface)
+        }
         capture.onError = { [weak self] message in
             self?.errorMessage = message
             self?.updateHint()
@@ -208,7 +248,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private func displayReconfigured() {
         guard let display else { return }
         let bounds = display.bounds
-        if bounds.width > 0 { streamView.displaySize = bounds.size }
+        if bounds.width > 0 {
+            streamView.displaySize = bounds.size
+            space?.streamView.displaySize = bounds.size
+        }
 
         if !captureStarted, CGPreflightScreenCaptureAccess() {
             captureStarted = true
@@ -216,7 +259,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         } else {
             capture.update(pixelSize: display.pixelSize)
         }
-        if Settings.fillWindows { host?.refit() }
+        if Settings.fillWindows {
+            host?.refit()
+        } else if let layout = pendingLayout {
+            host?.apply(layout)
+        }
+        pendingLayout = nil
+        // Kurz warten, bis die ersten Frames in der neuen Größe da sind.
+        onMain(after: 0.1) { [weak self] in self?.setStreamsFrozen(false) }
+    }
+
+    /// Auflösung des virtuellen Monitors ändern – mit Überblenden und ohne dass
+    /// normale Fenster durcheinandergeraten.
+    private func changeResolution(to size: CGSize) {
+        guard let display, let host else { return }
+        if !Settings.fillWindows, pendingLayout == nil { pendingLayout = host.layoutSnapshot() }
+        guard display.resize(to: size, immediately: true) else {
+            pendingLayout = nil
+            return
+        }
+        setStreamsFrozen(true)
+        // Sicherheitsnetz, falls keine Rückmeldung vom Display kommt.
+        let generation = dimGeneration
+        onMain(after: 2.5) { [weak self] in
+            guard let self, self.dimGeneration == generation else { return }
+            self.setStreamsFrozen(false)
+        }
+    }
+
+    /// Während des Auflösungswechsels das letzte Bild stehen lassen, danach überblenden.
+    private func setStreamsFrozen(_ frozen: Bool) {
+        dimGeneration += 1
+        streamView.setFrozen(frozen)
+        space?.streamView.setFrozen(frozen)
     }
 
     // MARK: Cursor-Schutz
@@ -255,7 +330,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     func windowDidEndLiveResize(_ notification: Notification) { resizeCursor.liveResizeEnded() }
 
     func windowDidResize(_ notification: Notification) {
-        guard Settings.resolutionFollowsWindow, let display else { return }
+        guard Settings.resolutionFollowsWindow, !(space?.isVisible ?? false), pushedHomeFrame == nil,
+              let display else { return }
         display.resize(to: currentStreamSize())
     }
 
@@ -274,7 +350,187 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     // MARK: Aktionen
 
     @objc private func toggleOverlay() {
-        if panel.isVisible { panel.orderOut(nil) } else { panel.orderFrontRegardless() }
+        overlayWanted.toggle()
+        if overlayWanted {
+            // Selbst zurückgeholt → evtl. hängender Mission-Control-Zustand ist egal.
+            expose.reset()
+            restorePushedPanel(animated: false)
+        }
+        updatePanelVisibility()
+    }
+
+    private func showOverlay() {
+        overlayWanted = true
+        expose.reset()
+        restorePushedPanel(animated: false)
+        updatePanelVisibility()
+    }
+
+    /// Overlay zeigen, wenn gewünscht – außer auf dem Kagami-Schreibtisch.
+    private func updatePanelVisibility() {
+        let show = overlayWanted && !(space?.isVisible ?? false)
+        if show, !panel.isVisible {
+            panel.orderFrontRegardless()
+        } else if !show, panel.isVisible {
+            restorePushedPanel(animated: false)
+            panel.orderOut(nil)
+        }
+        updateStreamThrottle()
+    }
+
+    /// Stream drosseln, solange niemand hinschaut.
+    private func updateStreamThrottle() {
+        let overlayVisible = panel.isVisible && pushedHomeFrame == nil
+        capture.setThrottled(!overlayVisible && !(space?.isVisible ?? false))
+    }
+
+    // MARK: Mission Control / Schreibtisch anzeigen
+
+    private func exposeChanged(_ state: ExposeWatcher.State) {
+        space?.suppressesPreview = state == .missionControl
+        switch state {
+        case .none: restorePushedPanel(animated: true)
+        case .missionControl: pushPanel(peek: 0)
+        case .desktop: pushPanel(peek: 18)
+        }
+    }
+
+    /// Schiebt das Overlay zum näheren Bildschirmrand – wie macOS es mit normalen Fenstern
+    /// macht. `peek` = wie viel noch zu sehen bleibt (0 = ganz weg und unsichtbar).
+    private func pushPanel(peek: CGFloat) {
+        guard panel.isVisible, let screen = panel.screen ?? NSScreen.main else { return }
+        // Läuft gerade noch das Zurückfahren, ist dessen Ziel der eigentliche Platz.
+        let returning = panelMover.isAnimating
+            ? NSRect(origin: panelMover.targetOrigin, size: panel.frame.size) : panel.frame
+        let home = pushedHomeFrame ?? returning
+        let screenFrame = screen.frame
+
+        func target(toLeft: Bool) -> NSRect {
+            var frame = home
+            frame.origin.x = toLeft ? screenFrame.minX - home.width + peek : screenFrame.maxX - peek
+            return frame
+        }
+        // Nicht auf einen Nachbarmonitor schieben.
+        let others = NSScreen.screens.filter { $0 != screen }.map(\.frame)
+        let preferLeft = home.midX < screenFrame.midX
+        let candidates = [target(toLeft: preferLeft), target(toLeft: !preferLeft)]
+        let free = candidates.first { frame in
+            !others.contains { $0.intersects(frame.insetBy(dx: peek + 1, dy: 0)) }
+        }
+        let destination = free ?? candidates[0]
+        let fadeOut = peek == 0 || free == nil
+
+        pushedHomeFrame = home
+        panel.allowsOffscreen = true
+        panel.ignoresMouseEvents = fadeOut
+        panelMover.move(to: destination.origin, alpha: fadeOut ? 0 : Settings.opacity,
+                        duration: fadeOut ? 0.16 : 0.2, on: screen)
+
+        // Klick auf den sichtbaren Rand holt das Overlay zurück.
+        if pushClickMonitor == nil {
+            pushClickMonitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { [weak self] event in
+                guard let self, self.pushedHomeFrame != nil, event.window === self.panel else { return event }
+                self.restorePushedPanel(animated: true)
+                return nil
+            }
+        }
+        updateStreamThrottle()
+    }
+
+    private func restorePushedPanel(animated: Bool) {
+        if let monitor = pushClickMonitor {
+            NSEvent.removeMonitor(monitor)
+            pushClickMonitor = nil
+        }
+        guard let home = pushedHomeFrame else { return }
+        pushedHomeFrame = nil
+        panel.ignoresMouseEvents = false
+        if animated {
+            let screen = NSScreen.screens.first { $0.frame.intersects(home) } ?? NSScreen.main
+            panelMover.move(to: home.origin, alpha: Settings.opacity, duration: 0.2, on: screen) { [weak self] in
+                guard let self, self.pushedHomeFrame == nil else { return }
+                self.panel.allowsOffscreen = false
+            }
+        } else {
+            panelMover.stop()
+            panel.setFrame(home, display: true)
+            panel.alphaValue = Settings.opacity
+            panel.allowsOffscreen = false
+        }
+        updateStreamThrottle()
+    }
+
+    // MARK: Kagami-Schreibtisch
+
+    private func setUpSpace() {
+        let space = KagamiSpace(streamDelegate: self)
+        space.streamView.displaySize = display?.requestedPointSize ?? streamView.displaySize
+        space.onActiveChange = { [weak self] active in self?.spaceActiveChanged(active) }
+        space.onVisibleChange = { [weak self] visible in self?.spaceVisibleChanged(visible) }
+        space.onLaunch = { [weak self] urls in self?.launch(urls) }
+        space.inputForwarder = inputForwarder
+        space.canForwardInput = { [weak self] in !(self?.host?.hosted.isEmpty ?? true) }
+
+        // Wird Kagami auf seinem Schreibtisch aktiv (beim Hineinwischen), gehört die
+        // Tastatur trotzdem der gehosteten App.
+        NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification,
+                                               object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, let space = self.space, space.isActive, space.launcher.isHidden else { return }
+                // Eigene Dialoge (z. B. „App in Kagami starten …“ › Datei wählen) nicht stören.
+                let ownDialogOpen = NSApp.modalWindow != nil
+                    || NSApp.windows.contains { $0 is NSSavePanel && $0.isVisible }
+                guard !ownDialogOpen else { return }
+                self.focusHostedApp()
+            }
+        }
+        self.space = space
+        if Settings.kagamiSpace {
+            onMain(after: 0.8) { [weak self] in self?.space?.enable() }
+        }
+    }
+
+    /// Beginnt man hineinzuwischen, wird die Auflösung schon umgestellt – bis die Geste
+    /// fertig ist, ist der virtuelle Monitor meist schon bereit.
+    private func spaceVisibleChanged(_ visible: Bool) {
+        guard let space else { return }
+        updatePanelVisibility()
+        if visible {
+            if sizeBeforeSpace == nil { sizeBeforeSpace = display?.requestedPointSize }
+            changeResolution(to: space.screenSize)
+        } else {
+            let size = Settings.resolutionFollowsWindow ? currentStreamSize() : sizeBeforeSpace
+            sizeBeforeSpace = nil
+            if let size { changeResolution(to: size) }
+        }
+    }
+
+    /// Rein- oder rausgewischt.
+    private func spaceActiveChanged(_ active: Bool) {
+        guard let space else { return }
+        updatePanelVisibility()
+        inputForwarder.forceHIDClicks = active
+        guard active else { return }
+        if host?.hosted.isEmpty ?? true {
+            if permissionsGranted { space.showLauncher() }
+        } else {
+            focusHostedApp()
+            // Kagami selbst wird beim Wischen evtl. erst danach aktiv – noch einmal nachziehen.
+            onMain(after: 0.25) { [weak self] in
+                guard let self, self.space?.isActive ?? false,
+                      NSApp.isActive || self.host?.activePID == nil else { return }
+                self.focusHostedApp()
+            }
+        }
+    }
+
+    /// Tastatur an die gehostete App geben (die zuletzt benutzte).
+    private func focusHostedApp() {
+        guard let host, !host.hosted.isEmpty else { return }
+        let last = lastHostedPID.flatMap { host.hosted[$0] != nil ? $0 : nil }
+        if let pid = host.activePID ?? last ?? host.order.first {
+            host.focus(pid: pid)
+        }
     }
 
     @objc private func refitWindows() {
@@ -391,6 +647,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
 
     private func permissionTick() {
+        expose.start()
         // Bildschirmaufnahme wurde evtl. gerade erlaubt → Stream starten.
         if !captureStarted, let display, CGPreflightScreenCaptureAccess() {
             captureStarted = true
@@ -401,6 +658,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
 
     private func updateHint() {
+        updateOverlayHint()
+        // Kagami-Schreibtisch: nur Fehler/Berechtigungen – bei leerem Bildschirm zeigt er den Starter.
+        let empty = host?.hosted.isEmpty ?? true
+        let overlayHintIsEmptyHint = empty && errorMessage == nil && permissionsGranted
+        space?.streamView.setHint(overlayHintIsEmptyHint
+            ? (space?.launcher.isHidden ?? true ? "Noch keine App in Kagami." : nil)
+            : streamView.currentHint)
+    }
+
+    private func updateOverlayHint() {
         if let errorMessage {
             streamView.setHint(errorMessage)
         } else if !CGPreflightScreenCaptureAccess() {
@@ -422,8 +689,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
 
     private func fillMainMenu(_ menu: NSMenu) {
-        menu.addItem(ActionMenuItem(panel.isVisible ? "Overlay ausblenden" : "Overlay einblenden",
+        menu.addItem(ActionMenuItem(overlayWanted ? "Overlay ausblenden" : "Overlay einblenden",
                                     key: "k", modifiers: [.control, .option]) { [weak self] in self?.toggleOverlay() })
+        if Settings.kagamiSpace, let space, space.exists, !space.isActive {
+            menu.addItem(ActionMenuItem("Zum Kagami-Schreibtisch wechseln") { [weak self] in self?.space?.reveal() })
+        }
         menu.addItem(.separator())
 
         addHostingItems(to: menu)
@@ -450,9 +720,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         openFull.state = Settings.openFullscreen ? .on : .off
         menu.addItem(openFull)
 
+        let spaceItem = ActionMenuItem("Eigener Kagami-Schreibtisch (Wischen)") { [weak self] in
+            Settings.kagamiSpace.toggle()
+            if Settings.kagamiSpace { self?.space?.enable() } else { self?.space?.disable() }
+        }
+        spaceItem.state = Settings.kagamiSpace ? .on : .off
+        menu.addItem(spaceItem)
+
         let follow = ActionMenuItem("Auflösung folgt Fenstergröße") { [weak self] in
             Settings.resolutionFollowsWindow.toggle()
-            if Settings.resolutionFollowsWindow, let self { self.display?.resize(to: self.currentStreamSize()) }
+            if Settings.resolutionFollowsWindow, let self, !(self.space?.isActive ?? false) {
+                self.display?.resize(to: self.currentStreamSize())
+            }
         }
         follow.state = Settings.resolutionFollowsWindow ? .on : .off
         menu.addItem(follow)
@@ -475,7 +754,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         for value in [1.0, 0.9, 0.75, 0.5] as [CGFloat] {
             let item = ActionMenuItem("\(Int(value * 100)) %") { [weak self] in
                 Settings.opacity = value
-                self?.panel.alphaValue = value
+                if self?.pushedHomeFrame == nil { self?.panel.alphaValue = value }
             }
             item.state = abs(Settings.opacity - value) < 0.01 ? .on : .off
             opacityMenu.addItem(item)
@@ -550,8 +829,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
         menu.addItem(ActionMenuItem("App in Kagami starten …") { [weak self] in
             guard let self else { return }
-            self.panel.orderFrontRegardless()
-            self.showLauncher()
+            if let space = self.space, space.isActive {
+                space.showLauncher()
+            } else {
+                self.showOverlay()
+                self.showLauncher()
+            }
         })
     }
 

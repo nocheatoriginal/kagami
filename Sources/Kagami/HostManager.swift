@@ -261,6 +261,46 @@ final class HostManager {
         }
     }
 
+    /// Position eines Fensters relativ zur Größe des virtuellen Monitors (0…1).
+    struct WindowLayout {
+        let window: AXUIElement
+        let relative: CGRect
+    }
+
+    /// Merkt sich die Lage aller normalen (nicht-Vollbild) Fenster relativ zum Monitor –
+    /// damit sie nach einem Auflösungswechsel wieder an derselben Stelle stehen.
+    func layoutSnapshot() -> [WindowLayout] {
+        let b = display.bounds
+        guard b.width > 0, b.height > 0 else { return [] }
+        var result: [WindowLayout] = []
+        for pid in order {
+            for window in AXHelpers.windows(pid: pid) where AXHelpers.isStandardWindow(window) {
+                guard isOnVirtualDisplay(window), !AXHelpers.isFullScreen(window),
+                      let f = AXHelpers.frame(window) else { continue }
+                let relative = CGRect(x: (f.minX - b.minX) / b.width, y: (f.minY - b.minY) / b.height,
+                                      width: f.width / b.width, height: f.height / b.height)
+                result.append(WindowLayout(window: window, relative: relative))
+            }
+        }
+        return result
+    }
+
+    /// Stellt eine mit `layoutSnapshot()` gemerkte Lage auf der aktuellen Auflösung wieder her.
+    func apply(_ layout: [WindowLayout]) {
+        let b = display.bounds
+        guard b.width > 0, b.height > 0 else { return }
+        for entry in layout {
+            let window = entry.window
+            guard !transitioning.contains(Self.key(window)), !AXHelpers.isFullScreen(window) else { continue }
+            let r = entry.relative
+            let frame = CGRect(x: b.minX + r.minX * b.width, y: b.minY + r.minY * b.height,
+                               width: r.width * b.width, height: r.height * b.height)
+            AXHelpers.setPosition(window, frame.origin)
+            AXHelpers.setSize(window, frame.size)
+            AXHelpers.setPosition(window, frame.origin)
+        }
+    }
+
     /// Vollbild-Fenster folgen einem Auflösungswechsel normalerweise selbst.
     /// Falls nicht, einmal kurz aus dem Vollbild und wieder hinein.
     private func refreshFullscreenSize(_ window: AXUIElement) {

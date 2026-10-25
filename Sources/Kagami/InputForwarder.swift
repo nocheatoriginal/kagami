@@ -22,6 +22,13 @@ enum InputMode: String, CaseIterable {
 @MainActor
 final class InputForwarder {
     var mode: InputMode = .direct
+    /// Klicks, Ziehen und Scrollen immer als echte HID-Events (Kagami-Schreibtisch):
+    /// Chrome/Brave/Electron (Discord, Slack …) ignorieren direkt zugestellte Events, und
+    /// nur ein echter Klick macht die App zuverlässig aktiv – dann folgt auch die Tastatur.
+    /// Hover bleibt im Direkt-Modus, damit der Cursor nicht ständig springt.
+    var forceHIDClicks = false
+    /// Markierung an allen Events, die Kagami selbst erzeugt (damit Event-Taps sie erkennen).
+    static let eventMarker: Int64 = 0x4B47_4D49
     /// Prozess-ID von Kagami selbst – eigene Fenster werden ignoriert.
     private let ownPID = ProcessInfo.processInfo.processIdentifier
     private let source: CGEventSource? = {
@@ -90,6 +97,13 @@ final class InputForwarder {
         deliver(event, at: point, target: window(at: point))
     }
 
+    /// Ein vorhandenes Event (z. B. Scrollen mit Trägheit und Phasen) unverändert an
+    /// einen Punkt auf dem virtuellen Display weiterreichen.
+    func forward(_ event: CGEvent, to point: CGPoint) {
+        event.location = point
+        deliver(event, at: point, target: window(at: point))
+    }
+
     // MARK: Intern
 
     private func post(_ type: CGEventType, button: CGMouseButton, at point: CGPoint,
@@ -109,7 +123,9 @@ final class InputForwarder {
             return app.activationPolicy != .prohibited
         }()
 
-        if mode == .direct, directPossible, let target {
+        event.setIntegerValueField(.eventSourceUserData, value: Self.eventMarker)
+        let wantsHID = forceHIDClicks && event.type != .mouseMoved
+        if mode == .direct, directPossible, !wantsHID, let target {
             event.setIntegerValueField(.mouseEventWindowUnderMousePointer, value: Int64(target.windowID))
             event.setIntegerValueField(.mouseEventWindowUnderMousePointerThatCanHandleThisEvent,
                                        value: Int64(target.windowID))
@@ -120,6 +136,9 @@ final class InputForwarder {
 
         let home = Geometry.cursorLocation
         cursorExcursionUntil = Date().addingTimeInterval(0.12)
+        // Scroll-Events bewegen den Cursor nicht selbst – sie gehen an das Fenster unter dem
+        // Cursor. Also kurz hinspringen.
+        if event.type == .scrollWheel { CGWarpMouseCursorPosition(point) }
         event.post(tap: .cghidEventTap)
         // Cursor sofort zurück – und nach kurzer Zeit noch einmal, falls das Event
         // erst nach unserem Warp verarbeitet wurde.

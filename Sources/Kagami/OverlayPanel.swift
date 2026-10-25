@@ -31,6 +31,13 @@ final class OverlayPanel: NSPanel {
     var allowsKey = false
     override var canBecomeKey: Bool { allowsKey }
     override var canBecomeMain: Bool { false }
+
+    /// Während das Overlay zur Seite geschoben ist (Mission Control / Schreibtisch),
+    /// darf es über den Bildschirmrand hinaus.
+    var allowsOffscreen = false
+    override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect {
+        allowsOffscreen ? frameRect : super.constrainFrameRect(frameRect, to: screen)
+    }
 }
 
 /// Button, der auch im inaktiven Fenster beim ersten Klick reagiert.
@@ -202,5 +209,82 @@ extension NSLayoutConstraint {
     func withPriority(_ priority: NSLayoutConstraint.Priority) -> NSLayoutConstraint {
         self.priority = priority
         return self
+    }
+}
+
+/// Bewegt ein Fenster flüssig im Takt des Bildschirms (auch 120 Hz) – deutlich direkter
+/// als `animator().setFrame`, das spürbar hinterherzieht.
+@MainActor
+final class WindowMover: NSObject {
+    private weak var window: NSWindow?
+    private var link: CADisplayLink?
+    private var from = NSPoint.zero
+    private var to = NSPoint.zero
+    private var fromAlpha: CGFloat = 1
+    private var toAlpha: CGFloat = 1
+    private var start: CFTimeInterval = 0
+    private var duration: CFTimeInterval = 0.2
+    private var completion: (@MainActor () -> Void)?
+
+    init(window: NSWindow) {
+        self.window = window
+    }
+
+    var isAnimating: Bool { link != nil }
+    /// Ziel der laufenden (bzw. letzten) Bewegung.
+    var targetOrigin: NSPoint { to }
+
+    /// `screen`: Bildschirm, dessen Takt benutzt wird. Wichtig: Ein Display-Link am Fenster
+    /// selbst bleibt stehen, sobald das Fenster unsichtbar/außerhalb des Bildschirms ist.
+    func move(to origin: NSPoint, alpha: CGFloat, duration: CFTimeInterval, on screen: NSScreen?,
+              completion: (@MainActor () -> Void)? = nil) {
+        guard let window else { return }
+        stop()
+        from = window.frame.origin
+        to = origin
+        fromAlpha = window.alphaValue
+        toAlpha = alpha
+        self.duration = max(duration, 0.01)
+        self.completion = completion
+        start = CACurrentMediaTime()
+        guard let screen = screen ?? NSScreen.main ?? NSScreen.screens.first else {
+            finish()
+            return
+        }
+        let link = screen.displayLink(target: self, selector: #selector(step(_:)))
+        link.add(to: .main, forMode: .common)
+        self.link = link
+        // Sicherheitsnetz: Kommt der Takt nicht, trotzdem am Ziel ankommen.
+        let startedAt = start
+        onMain(after: duration + 0.3) { [weak self] in
+            guard let self, self.link != nil, self.start == startedAt else { return }
+            self.finish()
+        }
+    }
+
+    /// Laufende Bewegung abbrechen (ohne Abschluss).
+    func stop() {
+        link?.invalidate()
+        link = nil
+        completion = nil
+    }
+
+    @objc private func step(_ link: CADisplayLink) {
+        guard let window else { stop(); return }
+        let t = min(1, (CACurrentMediaTime() - start) / duration)
+        let eased = CGFloat(1 - pow(1 - t, 3))   // ease-out: sofort schnell, weich am Ende
+        window.setFrameOrigin(NSPoint(x: from.x + (to.x - from.x) * eased, y: from.y + (to.y - from.y) * eased))
+        window.alphaValue = fromAlpha + (toAlpha - fromAlpha) * eased
+        if t >= 1 { finish() }
+    }
+
+    private func finish() {
+        link?.invalidate()
+        link = nil
+        window?.setFrameOrigin(to)
+        window?.alphaValue = toAlpha
+        let done = completion
+        completion = nil
+        done?()
     }
 }

@@ -58,15 +58,19 @@ final class VirtualDisplay {
     }
 
     /// Ändert die Auflösung, damit sie zum Overlay-Fenster passt (entprellt).
-    func resize(to pointSize: CGSize) {
-        apply(pointSize: pointSize, immediately: false)
+    /// Gibt `false` zurück, wenn sich nichts ändert.
+    /// `immediately` überspringt das Entprellen (z. B. beim Betreten des Kagami-Schreibtischs).
+    @discardableResult
+    func resize(to pointSize: CGSize, immediately: Bool = false) -> Bool {
+        apply(pointSize: pointSize, immediately: immediately)
     }
 
-    private func apply(pointSize: CGSize, immediately: Bool) {
+    @discardableResult
+    private func apply(pointSize: CGSize, immediately: Bool) -> Bool {
         let width = Self.roundTo8(pointSize.width.clamped(to: Self.minPointSize.width...Self.maxPointSize.width))
         let height = Self.roundTo8(pointSize.height.clamped(to: Self.minPointSize.height...Self.maxPointSize.height))
         let size = CGSize(width: width, height: height)
-        if size == requestedPointSize { return }
+        if size == requestedPointSize { return false }
         requestedPointSize = size
 
         generation += 1
@@ -75,6 +79,7 @@ final class VirtualDisplay {
             guard let self, self.generation == myGeneration else { return }  // entprellen
             self.applyNow()
         }
+        return true
     }
 
     private func applyNow() {
@@ -95,14 +100,30 @@ final class VirtualDisplay {
             NSLog("[Kagami] applySettings fehlgeschlagen für \(w)x\(h)")
         }
 
-        // macOS braucht einen Moment, bis die neuen Modi sichtbar sind.
-        onMain(after: 0.25) { [weak self] in
-            guard let self else { return }
-            self.selectModeAndPlace(width: w, height: h)
-            onMain(after: 0.25) { [weak self] in
-                self?.onReconfigured?()
+        // macOS braucht einen Moment, bis die neuen Modi sichtbar sind – kurz nachfragen
+        // statt pauschal zu warten.
+        waitForMode(width: w, height: h, generation: generation, attempt: 0)
+    }
+
+    private func waitForMode(width: Int, height: Int, generation myGeneration: Int, attempt: Int) {
+        guard generation == myGeneration else { return }   // inzwischen neue Größe angefordert
+        if hasMode(width: width, height: height) || attempt >= 15 {
+            selectModeAndPlace(width: width, height: height)
+            onMain(after: 0.08) { [weak self] in
+                guard let self, self.generation == myGeneration else { return }
+                self.onReconfigured?()
+            }
+        } else {
+            onMain(after: 0.03) { [weak self] in
+                self?.waitForMode(width: width, height: height, generation: myGeneration, attempt: attempt + 1)
             }
         }
+    }
+
+    private func hasMode(width: Int, height: Int) -> Bool {
+        let options = [kCGDisplayShowDuplicateLowResolutionModes: kCFBooleanTrue] as CFDictionary
+        let modes = (CGDisplayCopyAllDisplayModes(displayID, options) as? [CGDisplayMode]) ?? []
+        return modes.contains { $0.width == width && $0.height == height }
     }
 
     private func selectModeAndPlace(width: Int, height: Int) {

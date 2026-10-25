@@ -72,9 +72,43 @@ final class StreamView: NSView {
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
     override var mouseDownCanMoveWindow: Bool { false }
 
+    private var frozen = false
+    private var fadeNextFrame = false
+
     func display(surface: IOSurfaceRef) {
+        guard !frozen else { return }
+        if fadeNextFrame {
+            fadeNextFrame = false
+            let fade = CATransition()
+            fade.type = .fade
+            fade.duration = 0.18
+            imageLayer.add(fade, forKey: "fade")
+        }
         imageLayer.contents = surface
     }
+
+    /// Letztes Bild stehen lassen (z. B. während der virtuelle Monitor die Auflösung wechselt);
+    /// beim Auftauen wird weich auf das neue Bild übergeblendet.
+    func setFrozen(_ frozen: Bool) {
+        guard frozen != self.frozen else { return }
+        self.frozen = frozen
+        if !frozen { fadeNextFrame = true }
+    }
+
+    /// Für bildschirmfüllende Fenster: globaler CG-Punkt auf dem Bildschirm → Punkt auf dem
+    /// virtuellen Display. Mit `clamp` auch außerhalb des Bildes (an den Rand gesetzt).
+    func displayPoint(forScreenPoint point: CGPoint, screenRect: CGRect, clamp: Bool) -> CGPoint? {
+        guard let delegate else { return nil }
+        let local = CGPoint(x: point.x - screenRect.minX, y: point.y - screenRect.minY)
+        let rect = imageRect
+        guard rect.width > 0, rect.height > 0, clamp || rect.contains(local) else { return nil }
+        let nx = ((local.x - rect.minX) / rect.width).clamped(to: 0...0.9999)
+        let ny = ((local.y - rect.minY) / rect.height).clamped(to: 0...0.9999)
+        return delegate.streamView(self, globalPointFor: CGPoint(x: nx, y: ny))
+    }
+
+    /// Aktuell angezeigter Hinweis (nil = keiner).
+    var currentHint: String? { hintBackground.isHidden ? nil : hintLabel.stringValue }
 
     /// Hinweistext in der Mitte (nil = ausblenden).
     func setHint(_ text: String?) {
