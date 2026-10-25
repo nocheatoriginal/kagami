@@ -1,6 +1,6 @@
-# Kagami 鏡
+# Kagami
 
-Ein schwebender **zweiter Bildschirm im Fenster** für macOS. Zieh eine App ins Kagami-Fenster: Sie läuft dann auf einem eigenen virtuellen Monitor, und Kagami zeigt diesen Monitor live in einem Overlay, das auf **jedem Desktop/Space und über Vollbild-Apps** liegt. Du kannst die App dort direkt bedienen, also klicken, scrollen, tippen und ziehen.
+Ein Overlay für macOS. Zieh eine App ins Kagami-Fenster: Sie läuft dann auf einem eigenen virtuellen Monitor, und Kagami zeigt diesen Monitor live in einem Overlay, das auf **jedem Desktop/Space und über Vollbild-Apps** liegt. Du kannst die App dort direkt bedienen, also klicken, scrollen, tippen und ziehen.
 
 ## Wie es funktioniert
 
@@ -134,10 +134,3 @@ scripts/run.sh         Bauen + Starten
 scripts/install.sh     Bauen + nach /Applications installieren
 scripts/make_icon.py   App-Icon erzeugen (Python + Pillow)
 ```
-
-## Nächste Ideen
-
-* Mehrere Kagami-Fenster (je ein virtueller Monitor)
-* „Capture-Modus“ mit echtem Cursor auf dem virtuellen Monitor für Spiele
-* App-Icon, Login-Item, Einstellungsfenster
-* Fenster-Layouts pro App speichern
