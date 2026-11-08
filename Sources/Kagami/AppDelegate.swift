@@ -1,6 +1,5 @@
 import AppKit
 import Carbon.HIToolbox
-import UniformTypeIdentifiers
 
 @main
 @MainActor
@@ -73,6 +72,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         }
 
         inputForwarder.mode = Settings.inputMode
+        // Hängt eine gehostete App, blockiert jeder Accessibility-Aufruf sonst bis zu 6 s.
+        AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), 1.0)
+        // Installierte Apps schon jetzt im Hintergrund einlesen – dann öffnet der Starter sofort.
+        AppCatalog.load { _ in }
         buildPanel()
         buildStatusItem()
         hotKey = HotKey(id: 1, keyCode: kVK_ANSI_K, modifiers: controlKey | optionKey) { [weak self] in
@@ -180,7 +183,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         panelMover = WindowMover(window: panel)
         panel.orderFrontRegardless()
         container.layoutSubtreeIfNeeded()
-        updateTitle()
+        updateTabs()
     }
 
     private func buildStatusItem() {
@@ -208,11 +211,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         host.onActiveAppChange = { [weak self] in
             guard let self else { return }
             if let pid = self.host?.activePID { self.lastHostedPID = pid }
-            self.updateTitle()
+            self.updateTabs()
         }
         host.onChange = { [weak self] in
             guard let self else { return }
-            self.updateTitle()
+            self.updateTabs()
             // Leerer Kagami-Bildschirm → Starter anbieten.
             let empty = self.host?.hosted.isEmpty ?? true
             if empty, self.permissionsGranted {
@@ -226,10 +229,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         }
         self.host = host
 
-        capture.onFrame = { [weak self] surface in
-            self?.streamView.display(surface: surface)
-            self?.space?.streamView.display(surface: surface)
-        }
+        capture.addSink(streamView.streamLayer)
         capture.onError = { [weak self] message in
             self?.errorMessage = message
             self?.updateHint()
@@ -274,7 +274,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private func changeResolution(to size: CGSize) {
         guard let display, let host else { return }
         if !Settings.fillWindows, pendingLayout == nil { pendingLayout = host.layoutSnapshot() }
-        guard display.resize(to: size, immediately: true) else {
+        guard display.resize(to: size) else {
             pendingLayout = nil
             return
         }
@@ -300,22 +300,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private func installCursorGuard() {
         lastSafeCursor = Geometry.cursorLocation
         let events: NSEvent.EventTypeMask = [.mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged]
-        if let global = NSEvent.addGlobalMonitorForEvents(matching: events, handler: { [weak self] _ in
-            self?.guardCursor()
-            self?.resizeCursor.update()
+        if let global = NSEvent.addGlobalMonitorForEvents(matching: events, handler: { [weak self] event in
+            self?.mouseMovedAnywhere(event)
         }) { cursorMonitors.append(global) }
         if let local = NSEvent.addLocalMonitorForEvents(matching: events, handler: { [weak self] event in
-            self?.guardCursor()
-            self?.resizeCursor.update()
+            self?.mouseMovedAnywhere(event)
             return event
         }) { cursorMonitors.append(local) }
     }
 
-    private func guardCursor() {
+    private func mouseMovedAnywhere(_ event: NSEvent) {
+        guardCursor(at: event.cgEvent?.location ?? Geometry.cursorLocation)
+        resizeCursor.update()
+    }
+
+    private func guardCursor(at location: CGPoint) {
         guard let display else { return }
-        let location = Geometry.cursorLocation
         if display.bounds.contains(location) {
-            if Date() > inputForwarder.cursorExcursionUntil {
+            if CACurrentMediaTime() > inputForwarder.cursorExcursionUntil {
                 CGWarpMouseCursorPosition(lastSafeCursor)
                 CGAssociateMouseAndMouseCursorPosition(1)
             }
@@ -327,12 +329,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     // MARK: NSWindowDelegate
 
     func windowWillStartLiveResize(_ notification: Notification) { resizeCursor.liveResizeStarted() }
-    func windowDidEndLiveResize(_ notification: Notification) { resizeCursor.liveResizeEnded() }
+
+    func windowDidEndLiveResize(_ notification: Notification) {
+        resizeCursor.liveResizeEnded()
+        resolutionFollowWindow()
+    }
 
     func windowDidResize(_ notification: Notification) {
-        guard Settings.resolutionFollowsWindow, !(space?.isVisible ?? false), pushedHomeFrame == nil,
-              let display else { return }
-        display.resize(to: currentStreamSize())
+        // Während des Ziehens nicht ständig umkonfigurieren (jede Änderung lässt alle gehosteten
+        // Apps neu layouten) – das Bild skaliert bis zum Loslassen einfach mit.
+        guard !panel.inLiveResize else { return }
+        resolutionFollowWindow()
+    }
+
+    /// Auflösung des virtuellen Monitors an die Overlay-Größe anpassen (falls eingestellt).
+    private func resolutionFollowWindow() {
+        guard Settings.resolutionFollowsWindow, !(space?.isVisible ?? false), pushedHomeFrame == nil else { return }
+        changeResolution(to: currentStreamSize())
     }
 
     // MARK: StreamViewDelegate
@@ -464,6 +477,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
     private func setUpSpace() {
         let space = KagamiSpace(streamDelegate: self)
+        capture.addSink(space.streamView.streamLayer)
         space.streamView.displaySize = display?.requestedPointSize ?? streamView.displaySize
         space.onActiveChange = { [weak self] active in self?.spaceActiveChanged(active) }
         space.onVisibleChange = { [weak self] visible in self?.spaceVisibleChanged(visible) }
@@ -576,12 +590,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         host?.toggleFullscreen()
     }
 
-    @objc private func showAddMenu(_ sender: NSButton) {
-        let menu = NSMenu()
-        addHostingItems(to: menu)
-        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.maxY + 4), in: sender)
-    }
-
     @objc private func showOptionsMenu(_ sender: NSButton) {
         let menu = NSMenu()
         fillMainMenu(menu)
@@ -593,23 +601,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         AXHelpers.requestTrust()
         updateHint()
         return false
-    }
-
-    private func chooseAppFromDisk() {
-        let panel = NSOpenPanel()
-        panel.allowedContentTypes = [.application]
-        panel.directoryURL = URL(fileURLWithPath: "/Applications")
-        panel.allowsMultipleSelection = true
-        panel.prompt = "In Kagami öffnen"
-        NSApp.activate(ignoringOtherApps: true)
-        panel.begin { [weak self] response in
-            guard response == .OK else { return }
-            let urls = panel.urls
-            MainActor.assumeIsolated {
-                guard let self, self.ensureAccessibility() else { return }
-                urls.forEach { self.host?.host(appAt: $0) }
-            }
-        }
     }
 
     private func restart() {
@@ -626,9 +617,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     // MARK: Anzeige
 
     /// Tabs in der oberen Leiste aktualisieren.
-    private func updateTitle() {
+    private func updateTabs() {
         let apps = (host?.hostedApps ?? []).map { (pid: $0.pid, name: $0.name, icon: $0.app.icon) }
-        topBar.titleLabel.stringValue = "Kagami"
         topBar.setApps(apps, active: host?.activePID)
     }
 
@@ -655,6 +645,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             capture.start(displayID: display.displayID, pixelSize: display.pixelSize)
         }
         updateHint()
+        // Alles erlaubt und läuft → nicht mehr nachsehen.
+        if captureStarted, AXHelpers.isTrusted {
+            permissionTimer?.invalidate()
+            permissionTimer = nil
+        }
     }
 
     private func updateHint() {
@@ -729,9 +724,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
         let follow = ActionMenuItem("Auflösung folgt Fenstergröße") { [weak self] in
             Settings.resolutionFollowsWindow.toggle()
-            if Settings.resolutionFollowsWindow, let self, !(self.space?.isActive ?? false) {
-                self.display?.resize(to: self.currentStreamSize())
-            }
+            self?.resolutionFollowWindow()
         }
         follow.state = Settings.resolutionFollowsWindow ? .on : .off
         menu.addItem(follow)

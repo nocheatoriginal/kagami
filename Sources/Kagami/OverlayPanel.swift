@@ -110,8 +110,17 @@ final class TopBar: NSView {
         window?.performDrag(with: event)
     }
 
+    private var shownApps: [pid_t] = []
+    private var shownActive: pid_t?
+
     /// Tabs für die gehosteten Apps setzen; `active` wird hervorgehoben.
+    /// Wird bei jedem App-Wechsel im ganzen System aufgerufen – deshalb nur neu bauen,
+    /// wenn sich wirklich etwas geändert hat.
     func setApps(_ apps: [(pid: pid_t, name: String, icon: NSImage?)], active: pid_t?) {
+        let pids = apps.map { $0.pid }
+        guard pids != shownApps || active != shownActive else { return }
+        shownApps = pids
+        shownActive = active
         appStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
         titleLabel.isHidden = !apps.isEmpty
         for app in apps {

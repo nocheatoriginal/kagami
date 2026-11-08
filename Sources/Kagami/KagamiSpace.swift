@@ -294,48 +294,25 @@ final class KagamiSpace: NSObject, NSWindowDelegate {
         // Menüleiste, Dock, Mitteilungen usw. bleiben normal bedienbar.
         let windowUnder = event.getIntegerValueField(.mouseEventWindowUnderMousePointer)
         let overUs = windowUnder == 0 || windowUnder == Int64(window.windowNumber)
-        let isDown = type == .leftMouseDown || type == .rightMouseDown || type == .otherMouseDown
+        let action = MousePhase.from(type)
+        let isDown = action?.phase == .down
         if !overUs, !(dragging && !isDown) { return false }
 
         guard let point = streamView.displayPoint(forScreenPoint: location, screenRect: screenRect,
                                                   clamp: dragging && !isDown) else {
             return isDown   // Klick neben das Bild: verschlucken, damit Kagami nicht aktiv wird
         }
-        let flags = event.flags
-        let clicks = Int(event.getIntegerValueField(.mouseEventClickState))
 
-        switch type {
-        case .leftMouseDown:
-            dragging = true
-            forwarder.mouseDown(.left, at: point, clickCount: clicks, flags: flags)
-        case .leftMouseDragged:
-            forwarder.mouseDragged(.left, at: point, flags: flags)
-        case .leftMouseUp:
-            dragging = false
-            forwarder.mouseUp(.left, at: point, clickCount: clicks, flags: flags)
-        case .rightMouseDown:
-            dragging = true
-            forwarder.mouseDown(.right, at: point, clickCount: clicks, flags: flags)
-        case .rightMouseDragged:
-            forwarder.mouseDragged(.right, at: point, flags: flags)
-        case .rightMouseUp:
-            dragging = false
-            forwarder.mouseUp(.right, at: point, clickCount: clicks, flags: flags)
-        case .otherMouseDown:
-            dragging = true
-            forwarder.mouseDown(.center, at: point, clickCount: clicks, flags: flags)
-        case .otherMouseDragged:
-            forwarder.mouseDragged(.center, at: point, flags: flags)
-        case .otherMouseUp:
-            dragging = false
-            forwarder.mouseUp(.center, at: point, clickCount: clicks, flags: flags)
-        case .scrollWheel:
+        if type == .scrollWheel {
             // Original weiterreichen – behält Trägheit und Scroll-Phasen.
             guard let copy = event.copy() else { return false }
             forwarder.forward(copy, to: point)
-        default:
-            return false
+            return true
         }
+        guard let action else { return false }
+        if action.phase != .dragged { dragging = action.phase == .down }
+        forwarder.mouse(action.phase, action.button, at: point,
+                        clickCount: Int(event.getIntegerValueField(.mouseEventClickState)), flags: event.flags)
         return true
     }
 

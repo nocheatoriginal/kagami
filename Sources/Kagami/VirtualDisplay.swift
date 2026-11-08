@@ -54,19 +54,13 @@ final class VirtualDisplay {
         let display = CGVirtualDisplay(descriptor: descriptor)
         guard display.displayID != 0 else { return nil }
         self.display = display
-        apply(pointSize: pointSize, immediately: true)
+        resize(to: pointSize)
     }
 
-    /// Ändert die Auflösung, damit sie zum Overlay-Fenster passt (entprellt).
+    /// Ändert die Auflösung (z. B. passend zum Overlay-Fenster).
     /// Gibt `false` zurück, wenn sich nichts ändert.
-    /// `immediately` überspringt das Entprellen (z. B. beim Betreten des Kagami-Schreibtischs).
     @discardableResult
-    func resize(to pointSize: CGSize, immediately: Bool = false) -> Bool {
-        apply(pointSize: pointSize, immediately: immediately)
-    }
-
-    @discardableResult
-    private func apply(pointSize: CGSize, immediately: Bool) -> Bool {
+    func resize(to pointSize: CGSize) -> Bool {
         let width = Self.roundTo8(pointSize.width.clamped(to: Self.minPointSize.width...Self.maxPointSize.width))
         let height = Self.roundTo8(pointSize.height.clamped(to: Self.minPointSize.height...Self.maxPointSize.height))
         let size = CGSize(width: width, height: height)
@@ -74,9 +68,11 @@ final class VirtualDisplay {
         requestedPointSize = size
 
         generation += 1
+        // Erst im nächsten Runloop-Durchlauf: Mehrere Wünsche direkt hintereinander ergeben
+        // nur eine Umstellung.
         let myGeneration = generation
-        onMain(after: immediately ? 0 : 0.35) { [weak self] in
-            guard let self, self.generation == myGeneration else { return }  // entprellen
+        onMain { [weak self] in
+            guard let self, self.generation == myGeneration else { return }
             self.applyNow()
         }
         return true

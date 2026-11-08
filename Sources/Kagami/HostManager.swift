@@ -17,7 +17,6 @@ final class HostManager {
         var revealSince = Date()
         /// Wurde die App schon einmal kurz aktiviert, um Fenster auf anderen Spaces zu erreichen?
         var visited = false
-        let hostedAt = Date()
         init(app: NSRunningApplication) { self.app = app }
         var name: String { app.localizedName ?? app.bundleIdentifier ?? "App" }
         var pid: pid_t { app.processIdentifier }
@@ -147,11 +146,13 @@ final class HostManager {
             app.unhide()
         }
         // Läuft schon, hat aber kein Fenster? Dann wie ein Klick aufs Dock-Icon ein neues anfordern.
-        if !launchedHidden, AXHelpers.windowsOnAllSpaces(pid: pid).filter(AXHelpers.isStandardWindow).isEmpty,
-           let url = app.bundleURL {
-            let config = NSWorkspace.OpenConfiguration()
-            config.activates = false
-            NSWorkspace.shared.openApplication(at: url, configuration: config) { _, _ in }
+        if !launchedHidden, let url = app.bundleURL {
+            AXHelpers.windowsOnAllSpaces(pid: pid) { windows in
+                guard !windows.contains(where: AXHelpers.isStandardWindow) else { return }
+                let config = NSWorkspace.OpenConfiguration()
+                config.activates = false
+                NSWorkspace.shared.openApplication(at: url, configuration: config) { _, _ in }
+            }
         }
         enqueue(timeout: 14) { [weak self] done in
             self?.captureWindows(pid: pid, attempt: 0, done: done)
@@ -164,11 +165,22 @@ final class HostManager {
     }
 
     private func captureWindows(pid: pid_t, attempt: Int, done: @escaping Done) {
+        guard hosted[pid] != nil else { return done() }
+        // Die (teure) Suche über alle Spaces nur ab und zu – und im Hintergrund.
+        if attempt % 4 == 0 {
+            AXHelpers.windowsOnAllSpaces(pid: pid) { [weak self] all in
+                guard let self else { return done() }
+                self.captureWindows(pid: pid, attempt: attempt, candidates: all, done: done)
+            }
+        } else {
+            captureWindows(pid: pid, attempt: attempt, candidates: AXHelpers.windows(pid: pid), done: done)
+        }
+    }
+
+    private func captureWindows(pid: pid_t, attempt: Int, candidates: [AXUIElement], done: @escaping Done) {
         guard let entry = hosted[pid] else { return done() }
         let maxAttempts = 30
-        // Die (teure) Suche über alle Spaces nur ab und zu.
-        let all = attempt % 4 == 0 ? AXHelpers.windowsOnAllSpaces(pid: pid) : AXHelpers.windows(pid: pid)
-        let windows = all.filter(AXHelpers.isStandardWindow)
+        let windows = candidates.filter(AXHelpers.isStandardWindow)
         var transfers = 0
 
         for window in windows where !transitioning.contains(Self.key(window)) {
@@ -483,25 +495,22 @@ final class HostManager {
 
     private func releaseWindows(of entry: HostedApp, done: @escaping Done) {
         let pid = entry.pid
-        let windows = AXHelpers.windowsOnAllSpaces(pid: pid).filter { isOnVirtualDisplay($0) }
-        let needsVisit = windows.isEmpty || windows.contains { AXHelpers.isFullScreen($0) }
-
-        let work: @MainActor (_ restore: Done?) -> Void = { [weak self] restore in
+        AXHelpers.windowsOnAllSpaces(pid: pid) { [weak self] all in
             guard let self else { return done() }
-            // Nach einem Besuch sind evtl. weitere Fenster sichtbar → neu einsammeln.
-            let current = restore == nil ? windows
-                : AXHelpers.windowsOnAllSpaces(pid: pid).filter { self.isOnVirtualDisplay($0) }
-            self.releaseSequentially(current) {
-                restore?()
-                done()
+            let windows = all.filter { self.isOnVirtualDisplay($0) }
+            guard windows.isEmpty || windows.contains(where: AXHelpers.isFullScreen) else {
+                return self.releaseSequentially(windows, done: done)
             }
-        }
-
-        if needsVisit {
             // In den Space der App springen, damit Vollbild-Fenster sicher reagieren.
-            visit(pid: pid) { restore in work(restore) }
-        } else {
-            work(nil)
+            self.visit(pid: pid) { restore in
+                // Nach dem Besuch sind evtl. weitere Fenster sichtbar → neu einsammeln.
+                AXHelpers.windowsOnAllSpaces(pid: pid) { all in
+                    self.releaseSequentially(all.filter { self.isOnVirtualDisplay($0) }) {
+                        restore()
+                        done()
+                    }
+                }
+            }
         }
     }
 

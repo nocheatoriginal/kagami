@@ -18,6 +18,41 @@ enum InputMode: String, CaseIterable {
     }
 }
 
+/// Phase eines Maus-Klicks bzw. -Drags.
+enum MousePhase {
+    case down, dragged, up
+
+    func eventType(_ button: CGMouseButton) -> CGEventType {
+        switch (self, button) {
+        case (.down, .left): return .leftMouseDown
+        case (.down, .right): return .rightMouseDown
+        case (.down, _): return .otherMouseDown
+        case (.dragged, .left): return .leftMouseDragged
+        case (.dragged, .right): return .rightMouseDragged
+        case (.dragged, _): return .otherMouseDragged
+        case (.up, .left): return .leftMouseUp
+        case (.up, .right): return .rightMouseUp
+        case (.up, _): return .otherMouseUp
+        }
+    }
+
+    /// Umkehrung von `eventType`: welche Phase/Taste ein CGEvent-Typ ist (nil = kein Klick/Drag).
+    static func from(_ type: CGEventType) -> (phase: MousePhase, button: CGMouseButton)? {
+        switch type {
+        case .leftMouseDown: return (.down, .left)
+        case .leftMouseDragged: return (.dragged, .left)
+        case .leftMouseUp: return (.up, .left)
+        case .rightMouseDown: return (.down, .right)
+        case .rightMouseDragged: return (.dragged, .right)
+        case .rightMouseUp: return (.up, .right)
+        case .otherMouseDown: return (.down, .center)
+        case .otherMouseDragged: return (.dragged, .center)
+        case .otherMouseUp: return (.up, .center)
+        default: return nil
+        }
+    }
+}
+
 /// Übersetzt Maus-Events aus dem Overlay in Events auf dem virtuellen Display.
 @MainActor
 final class InputForwarder {
@@ -37,12 +72,16 @@ final class InputForwarder {
         return s
     }()
 
-    /// Bis zu diesem Zeitpunkt darf der Cursor auf dem virtuellen Display sein (Kompatibel-Modus).
-    private(set) var cursorExcursionUntil = Date.distantPast
+    /// Bis zu diesem Zeitpunkt (CACurrentMediaTime) darf der Cursor auf dem virtuellen Display sein.
+    private(set) var cursorExcursionUntil: CFTimeInterval = 0
 
     /// Ziel eines laufenden Drags – damit alle Drag-Events an dasselbe Fenster gehen.
     private var dragTarget: WindowTarget?
-    private var hoverCache: (point: CGPoint, target: WindowTarget?, time: Date)?
+    /// Zuletzt gefundenes Fenster. Die Fensterliste vom WindowServer zu holen kostet einige ms –
+    /// bei Hover und Scrollen (bis 120 Events/s) wäre das spürbar.
+    private var targetCache: (target: WindowTarget, time: CFTimeInterval)?
+    /// Darf der Prozess Events direkt bekommen? (Menüleiste, Dock & Co. nicht.)
+    private var directCapable: [pid_t: Bool] = [:]
 
     /// Fenster auf dem virtuellen Display unter einem Punkt.
     struct WindowTarget {
@@ -53,55 +92,32 @@ final class InputForwarder {
 
     // MARK: Maus
 
-    func mouseDown(_ button: CGMouseButton, at point: CGPoint, clickCount: Int, flags: CGEventFlags) {
-        let target = window(at: point)
-        dragTarget = target
-        if let target { bringToFront(target) }
-        post(Self.downType(button), button: button, at: point, clickCount: clickCount, flags: flags, target: target)
-    }
-
-    func mouseDragged(_ button: CGMouseButton, at point: CGPoint, flags: CGEventFlags) {
-        post(Self.dragType(button), button: button, at: point, clickCount: 1, flags: flags, target: dragTarget ?? window(at: point))
-    }
-
-    func mouseUp(_ button: CGMouseButton, at point: CGPoint, clickCount: Int, flags: CGEventFlags) {
-        post(Self.upType(button), button: button, at: point, clickCount: clickCount, flags: flags, target: dragTarget ?? window(at: point))
-        dragTarget = nil
+    func mouse(_ phase: MousePhase, _ button: CGMouseButton, at point: CGPoint, clickCount: Int, flags: CGEventFlags) {
+        let target: WindowTarget?
+        switch phase {
+        case .down:
+            target = window(at: point)
+            dragTarget = target
+            if let target { bringToFront(target) }
+        case .dragged, .up:
+            target = dragTarget ?? cachedWindow(at: point)
+        }
+        post(phase.eventType(button), button: button, at: point,
+             clickCount: phase == .dragged ? 1 : clickCount, flags: flags, target: target)
+        if phase == .up { dragTarget = nil }
     }
 
     /// Hover – nur im Direkt-Modus, sonst würde der Cursor ständig springen.
     func mouseMoved(at point: CGPoint, flags: CGEventFlags) {
-        guard mode == .direct else { return }
-        let target: WindowTarget?
-        if let cache = hoverCache, Date().timeIntervalSince(cache.time) < 0.25,
-           let t = cache.target, t.bounds.contains(point) {
-            target = t
-        } else {
-            target = window(at: point)
-            hoverCache = (point, target, Date())
-        }
-        guard let target else { return }
+        guard mode == .direct, let target = cachedWindow(at: point) else { return }
         post(.mouseMoved, button: .left, at: point, clickCount: 0, flags: flags, target: target)
-    }
-
-    func scroll(deltaX: CGFloat, deltaY: CGFloat, precise: Bool, at point: CGPoint, flags: CGEventFlags) {
-        let units: CGScrollEventUnit = precise ? .pixel : .line
-        let dy = Int32(precise ? deltaY.rounded() : deltaY.rounded(.awayFromZero))
-        let dx = Int32(precise ? deltaX.rounded() : deltaX.rounded(.awayFromZero))
-        guard dx != 0 || dy != 0,
-              let event = CGEvent(scrollWheelEvent2Source: source, units: units, wheelCount: 2,
-                                  wheel1: dy, wheel2: dx, wheel3: 0)
-        else { return }
-        event.location = point
-        event.flags = flags
-        deliver(event, at: point, target: window(at: point))
     }
 
     /// Ein vorhandenes Event (z. B. Scrollen mit Trägheit und Phasen) unverändert an
     /// einen Punkt auf dem virtuellen Display weiterreichen.
     func forward(_ event: CGEvent, to point: CGPoint) {
         event.location = point
-        deliver(event, at: point, target: window(at: point))
+        deliver(event, at: point, target: cachedWindow(at: point))
     }
 
     // MARK: Intern
@@ -116,16 +132,9 @@ final class InputForwarder {
     }
 
     private func deliver(_ event: CGEvent, at point: CGPoint, target: WindowTarget?) {
-        // Direkt-Modus nur für Fenster echter Apps. Menüleiste, Dock & Co. gehören
-        // System-Prozessen und brauchen echte HID-Events.
-        let directPossible: Bool = {
-            guard let target, let app = NSRunningApplication(processIdentifier: target.pid) else { return false }
-            return app.activationPolicy != .prohibited
-        }()
-
         event.setIntegerValueField(.eventSourceUserData, value: Self.eventMarker)
         let wantsHID = forceHIDClicks && event.type != .mouseMoved
-        if mode == .direct, directPossible, !wantsHID, let target {
+        if mode == .direct, !wantsHID, let target, canReceiveDirect(target.pid) {
             event.setIntegerValueField(.mouseEventWindowUnderMousePointer, value: Int64(target.windowID))
             event.setIntegerValueField(.mouseEventWindowUnderMousePointerThatCanHandleThisEvent,
                                        value: Int64(target.windowID))
@@ -135,7 +144,7 @@ final class InputForwarder {
         if mode == .direct, event.type == .mouseMoved { return }  // Hover nie per Cursorsprung
 
         let home = Geometry.cursorLocation
-        cursorExcursionUntil = Date().addingTimeInterval(0.12)
+        cursorExcursionUntil = CACurrentMediaTime() + 0.12
         // Scroll-Events bewegen den Cursor nicht selbst – sie gehen an das Fenster unter dem
         // Cursor. Also kurz hinspringen.
         if event.type == .scrollWheel { CGWarpMouseCursorPosition(point) }
@@ -153,6 +162,15 @@ final class InputForwarder {
         }
     }
 
+    /// Direkt-Modus nur für Fenster echter Apps. Menüleiste, Dock & Co. gehören
+    /// System-Prozessen und brauchen echte HID-Events.
+    private func canReceiveDirect(_ pid: pid_t) -> Bool {
+        if let known = directCapable[pid] { return known }
+        let capable = NSRunningApplication(processIdentifier: pid).map { $0.activationPolicy != .prohibited } ?? false
+        directCapable[pid] = capable
+        return capable
+    }
+
     /// Macht die App unter dem Klick zur aktiven App, damit Tastatureingaben dort landen.
     private func bringToFront(_ target: WindowTarget) {
         let appElement = AXUIElementCreateApplication(target.pid)
@@ -161,6 +179,15 @@ final class InputForwarder {
             AXUIElementSetAttributeValue(window, kAXMainAttribute as CFString, kCFBooleanTrue)
             AXUIElementPerformAction(window, kAXRaiseAction as CFString)
         }
+    }
+
+    /// Wie `window(at:)`, aber mit kurzem Cache, solange der Punkt im selben Fenster bleibt.
+    private func cachedWindow(at point: CGPoint) -> WindowTarget? {
+        let now = CACurrentMediaTime()
+        if let cache = targetCache, now - cache.time < 0.2, cache.target.bounds.contains(point) {
+            return cache.target
+        }
+        return window(at: point)
     }
 
     /// Oberstes Fenster (fremder Apps) unter `point` in CG-Koordinaten.
@@ -176,8 +203,11 @@ final class InputForwarder {
             else { continue }
             let alpha = info[kCGWindowAlpha as String] as? Double ?? 1
             if alpha < 0.01 { continue }
-            return WindowTarget(windowID: number, pid: pid, bounds: bounds)
+            let target = WindowTarget(windowID: number, pid: pid, bounds: bounds)
+            targetCache = (target, CACurrentMediaTime())
+            return target
         }
+        targetCache = nil
         return nil
     }
 
@@ -186,15 +216,5 @@ final class InputForwarder {
         var count: UInt32 = 0
         CGGetDisplaysWithPoint(point, 1, &id, &count)
         return id
-    }
-
-    private static func downType(_ b: CGMouseButton) -> CGEventType {
-        switch b { case .left: return .leftMouseDown; case .right: return .rightMouseDown; default: return .otherMouseDown }
-    }
-    private static func upType(_ b: CGMouseButton) -> CGEventType {
-        switch b { case .left: return .leftMouseUp; case .right: return .rightMouseUp; default: return .otherMouseUp }
-    }
-    private static func dragType(_ b: CGMouseButton) -> CGEventType {
-        switch b { case .left: return .leftMouseDragged; case .right: return .rightMouseDragged; default: return .otherMouseDragged }
     }
 }

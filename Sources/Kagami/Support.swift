@@ -88,3 +88,12 @@ final class HotKey {
         if let handlerRef { RemoveEventHandler(handlerRef) }
     }
 }
+
+extension NSDraggingInfo {
+    /// Per Drag & Drop gezogene `.app`-Bundles.
+    var appURLs: [URL] {
+        let urls = draggingPasteboard.readObjects(forClasses: [NSURL.self],
+                                                  options: [.urlReadingFileURLsOnly: true]) as? [URL] ?? []
+        return urls.filter { $0.pathExtension.lowercased() == "app" }
+    }
+}

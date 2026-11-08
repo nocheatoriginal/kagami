@@ -18,23 +18,23 @@ final class StreamView: NSView {
         didSet { needsLayout = true }
     }
 
-    private let imageLayer = CALayer()
+    /// Bekommt die Frames direkt von `DisplayCapture` (ohne Umweg über den Main-Thread).
+    let streamLayer = StreamLayer()
     private let hintLabel = NSTextField(wrappingLabelWithString: "")
     private let hintBackground = NSVisualEffectView()
     private var dropHighlight = false { didSet { updateBorder() } }
     private var trackingArea: NSTrackingArea?
-    private var lastMoveForward = Date.distantPast
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
         layer?.backgroundColor = NSColor.black.cgColor
 
-        imageLayer.contentsGravity = .resizeAspect
-        imageLayer.magnificationFilter = .linear
-        imageLayer.minificationFilter = .trilinear
-        imageLayer.actions = ["contents": NSNull(), "bounds": NSNull(), "position": NSNull()]
-        layer?.addSublayer(imageLayer)
+        streamLayer.contentsGravity = .resizeAspect
+        streamLayer.magnificationFilter = .linear
+        streamLayer.minificationFilter = .trilinear
+        streamLayer.actions = ["contents": NSNull(), "bounds": NSNull(), "position": NSNull()]
+        layer?.addSublayer(streamLayer)
 
         hintBackground.material = .hudWindow
         hintBackground.blendingMode = .withinWindow
@@ -72,39 +72,18 @@ final class StreamView: NSView {
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
     override var mouseDownCanMoveWindow: Bool { false }
 
-    private var frozen = false
-    private var fadeNextFrame = false
-
-    func display(surface: IOSurfaceRef) {
-        guard !frozen else { return }
-        if fadeNextFrame {
-            fadeNextFrame = false
-            let fade = CATransition()
-            fade.type = .fade
-            fade.duration = 0.18
-            imageLayer.add(fade, forKey: "fade")
-        }
-        imageLayer.contents = surface
-    }
-
     /// Letztes Bild stehen lassen (z. B. während der virtuelle Monitor die Auflösung wechselt);
     /// beim Auftauen wird weich auf das neue Bild übergeblendet.
     func setFrozen(_ frozen: Bool) {
-        guard frozen != self.frozen else { return }
-        self.frozen = frozen
-        if !frozen { fadeNextFrame = true }
+        streamLayer.setFrozen(frozen)
     }
 
     /// Für bildschirmfüllende Fenster: globaler CG-Punkt auf dem Bildschirm → Punkt auf dem
     /// virtuellen Display. Mit `clamp` auch außerhalb des Bildes (an den Rand gesetzt).
     func displayPoint(forScreenPoint point: CGPoint, screenRect: CGRect, clamp: Bool) -> CGPoint? {
-        guard let delegate else { return nil }
         let local = CGPoint(x: point.x - screenRect.minX, y: point.y - screenRect.minY)
-        let rect = imageRect
-        guard rect.width > 0, rect.height > 0, clamp || rect.contains(local) else { return nil }
-        let nx = ((local.x - rect.minX) / rect.width).clamped(to: 0...0.9999)
-        let ny = ((local.y - rect.minY) / rect.height).clamped(to: 0...0.9999)
-        return delegate.streamView(self, globalPointFor: CGPoint(x: nx, y: ny))
+        guard clamp || imageRect.contains(local) else { return nil }
+        return globalPoint(forLocal: local)
     }
 
     /// Aktuell angezeigter Hinweis (nil = keiner).
@@ -112,6 +91,7 @@ final class StreamView: NSView {
 
     /// Hinweistext in der Mitte (nil = ausblenden).
     func setHint(_ text: String?) {
+        guard text != currentHint else { return }
         hintLabel.stringValue = text ?? ""
         hintBackground.isHidden = (text == nil)
     }
@@ -120,7 +100,7 @@ final class StreamView: NSView {
         super.layout()
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        imageLayer.frame = bounds
+        streamLayer.frame = bounds
         CATransaction.commit()
     }
 
@@ -137,107 +117,92 @@ final class StreamView: NSView {
     /// Bereich, in dem das Bild tatsächlich gezeigt wird (Aspect-Fit, in View-Koordinaten).
     var imageRect: CGRect { Geometry.aspectFitRect(content: displaySize, in: bounds) }
 
-    private func globalPoint(for event: NSEvent) -> CGPoint? {
-        guard let delegate else { return nil }
-        let p = convert(event.locationInWindow, from: nil)
+    /// Punkt in View-Koordinaten → globaler CG-Punkt auf dem virtuellen Display (an den Rand geklemmt).
+    private func globalPoint(forLocal p: CGPoint) -> CGPoint? {
         let rect = imageRect
-        guard rect.width > 0, rect.height > 0 else { return nil }
+        guard let delegate, rect.width > 0, rect.height > 0 else { return nil }
         let nx = ((p.x - rect.minX) / rect.width).clamped(to: 0...0.9999)
         let ny = ((p.y - rect.minY) / rect.height).clamped(to: 0...0.9999)
         return delegate.streamView(self, globalPointFor: CGPoint(x: nx, y: ny))
     }
 
+    private func localPoint(_ event: NSEvent) -> CGPoint { convert(event.locationInWindow, from: nil) }
+
     private func flags(_ event: NSEvent) -> CGEventFlags {
         CGEventFlags(rawValue: UInt64(event.modifierFlags.rawValue))
     }
 
-    private func isInsideImage(_ event: NSEvent) -> Bool {
-        imageRect.contains(convert(event.locationInWindow, from: nil))
-    }
-
     // MARK: Maus
 
-    override func mouseDown(with event: NSEvent) {
-        guard isInsideImage(event), let p = globalPoint(for: event) else { return }
-        delegate?.inputForwarder.mouseDown(.left, at: p, clickCount: event.clickCount, flags: flags(event))
-    }
-    override func mouseDragged(with event: NSEvent) {
-        guard let p = globalPoint(for: event) else { return }
-        delegate?.inputForwarder.mouseDragged(.left, at: p, flags: flags(event))
-    }
-    override func mouseUp(with event: NSEvent) {
-        guard let p = globalPoint(for: event) else { return }
-        delegate?.inputForwarder.mouseUp(.left, at: p, clickCount: event.clickCount, flags: flags(event))
-    }
+    override func mouseDown(with event: NSEvent) { forward(.down, .left, event) }
+    override func mouseDragged(with event: NSEvent) { forward(.dragged, .left, event) }
+    override func mouseUp(with event: NSEvent) { forward(.up, .left, event) }
+    override func rightMouseDown(with event: NSEvent) { forward(.down, .right, event) }
+    override func rightMouseDragged(with event: NSEvent) { forward(.dragged, .right, event) }
+    override func rightMouseUp(with event: NSEvent) { forward(.up, .right, event) }
+    override func otherMouseDown(with event: NSEvent) { forward(.down, .center, event) }
+    override func otherMouseDragged(with event: NSEvent) { forward(.dragged, .center, event) }
+    override func otherMouseUp(with event: NSEvent) { forward(.up, .center, event) }
 
-    override func rightMouseDown(with event: NSEvent) {
-        guard isInsideImage(event), let p = globalPoint(for: event) else { return }
-        delegate?.inputForwarder.mouseDown(.right, at: p, clickCount: event.clickCount, flags: flags(event))
-    }
-    override func rightMouseDragged(with event: NSEvent) {
-        guard let p = globalPoint(for: event) else { return }
-        delegate?.inputForwarder.mouseDragged(.right, at: p, flags: flags(event))
-    }
-    override func rightMouseUp(with event: NSEvent) {
-        guard let p = globalPoint(for: event) else { return }
-        delegate?.inputForwarder.mouseUp(.right, at: p, clickCount: event.clickCount, flags: flags(event))
-    }
-
-    override func otherMouseDown(with event: NSEvent) {
-        guard isInsideImage(event), let p = globalPoint(for: event) else { return }
-        delegate?.inputForwarder.mouseDown(.center, at: p, clickCount: event.clickCount, flags: flags(event))
-    }
-    override func otherMouseDragged(with event: NSEvent) {
-        guard let p = globalPoint(for: event) else { return }
-        delegate?.inputForwarder.mouseDragged(.center, at: p, flags: flags(event))
-    }
-    override func otherMouseUp(with event: NSEvent) {
-        guard let p = globalPoint(for: event) else { return }
-        delegate?.inputForwarder.mouseUp(.center, at: p, clickCount: event.clickCount, flags: flags(event))
+    /// Klicks starten nur auf dem Bild; Drags und Loslassen werden an den Rand geklemmt.
+    private func forward(_ phase: MousePhase, _ button: CGMouseButton, _ event: NSEvent) {
+        let local = localPoint(event)
+        if phase == .down, !imageRect.contains(local) { return }
+        guard let p = globalPoint(forLocal: local) else { return }
+        delegate?.inputForwarder.mouse(phase, button, at: p, clickCount: event.clickCount, flags: flags(event))
     }
 
     override func mouseMoved(with event: NSEvent) {
-        // Auf ~60 Hz drosseln.
-        let now = Date()
-        guard now.timeIntervalSince(lastMoveForward) > 1.0 / 60.0, isInsideImage(event),
-              let p = globalPoint(for: event) else { return }
-        lastMoveForward = now
+        // AppKit fasst Mausbewegungen bereits pro Bildschirm-Frame zusammen – keine eigene Drosselung,
+        // damit die letzte Position (und damit der Hover-Zustand) nie verloren geht.
+        let local = localPoint(event)
+        guard imageRect.contains(local), let p = globalPoint(forLocal: local) else { return }
         delegate?.inputForwarder.mouseMoved(at: p, flags: flags(event))
     }
 
     override func scrollWheel(with event: NSEvent) {
-        guard isInsideImage(event), let p = globalPoint(for: event) else { return }
-        // Stream ist ggf. skaliert: Pixel-Deltas entsprechend umrechnen.
-        let scale = imageRect.width > 0 ? displaySize.width / imageRect.width : 1
-        let precise = event.hasPreciseScrollingDeltas
-        let dx = precise ? event.scrollingDeltaX * scale : event.scrollingDeltaX
-        let dy = precise ? event.scrollingDeltaY * scale : event.scrollingDeltaY
-        delegate?.inputForwarder.scroll(deltaX: dx, deltaY: dy, precise: precise, at: p, flags: flags(event))
+        let local = localPoint(event)
+        guard imageRect.contains(local), let p = globalPoint(forLocal: local),
+              let copy = event.cgEvent?.copy() else { return }
+        // Original weiterreichen – behält Trägheit, Gummiband und Scroll-Phasen.
+        // Ist der Stream skaliert, die Pixel-Deltas entsprechend umrechnen.
+        let rect = imageRect
+        let scale = rect.width > 0 ? displaySize.width / rect.width : 1
+        if event.hasPreciseScrollingDeltas, abs(scale - 1) > 0.02 {
+            Self.scaleScrollDeltas(copy, by: scale)
+        }
+        delegate?.inputForwarder.forward(copy, to: p)
+    }
+
+    private static func scaleScrollDeltas(_ event: CGEvent, by scale: CGFloat) {
+        let pointFields: [CGEventField] = [.scrollWheelEventPointDeltaAxis1, .scrollWheelEventPointDeltaAxis2]
+        for field in pointFields {
+            let value = Double(event.getIntegerValueField(field)) * Double(scale)
+            event.setIntegerValueField(field, value: Int64(value.rounded()))
+        }
+        let fixedFields: [CGEventField] = [.scrollWheelEventFixedPtDeltaAxis1, .scrollWheelEventFixedPtDeltaAxis2]
+        for field in fixedFields {
+            event.setDoubleValueField(field, value: event.getDoubleValueField(field) * Double(scale))
+        }
     }
 
     // MARK: Drag & Drop von Apps
 
-    private func appURLs(from info: NSDraggingInfo) -> [URL] {
-        let options: [NSPasteboard.ReadingOptionKey: Any] = [.urlReadingFileURLsOnly: true]
-        let urls = info.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: options) as? [URL] ?? []
-        return urls.filter { $0.pathExtension.lowercased() == "app" }
-    }
-
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
-        let ok = !appURLs(from: sender).isEmpty
+        let ok = !sender.appURLs.isEmpty
         dropHighlight = ok
         return ok ? .link : []
     }
 
     override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
-        appURLs(from: sender).isEmpty ? [] : .link
+        dropHighlight ? .link : []
     }
 
     override func draggingExited(_ sender: NSDraggingInfo?) { dropHighlight = false }
 
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
         dropHighlight = false
-        let urls = appURLs(from: sender)
+        let urls = sender.appURLs
         guard !urls.isEmpty else { return false }
         delegate?.streamView(self, didReceiveAppURLs: urls)
         return true

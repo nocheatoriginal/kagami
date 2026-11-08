@@ -15,10 +15,6 @@ enum Geometry {
         CGRect(x: rect.minX, y: primaryScreenHeight - rect.maxY, width: rect.width, height: rect.height)
     }
 
-    static func cgPoint(fromCocoa point: NSPoint) -> CGPoint {
-        CGPoint(x: point.x, y: primaryScreenHeight - point.y)
-    }
-
     static func screen(for displayID: CGDirectDisplayID) -> NSScreen? {
         NSScreen.screens.first { screen in
             let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber

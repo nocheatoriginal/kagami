@@ -7,6 +7,87 @@ struct InstalledApp {
     let bundleID: String?
 }
 
+/// Alle installierten Apps – im Hintergrund eingelesen und zwischengespeichert, damit der
+/// Starter sofort aufgeht und das Dateisystem nicht bei jedem Öffnen durchsucht wird.
+@MainActor
+enum AppCatalog {
+    private(set) static var apps: [InstalledApp] = []
+    private static var scanning = false
+    private static var waiting: [@MainActor ([InstalledApp]) -> Void] = []
+    private static var icons: [URL: NSImage] = [:]
+
+    /// Liefert sofort den bekannten Stand und – falls sich nach dem erneuten Einlesen
+    /// etwas geändert hat – noch einmal den neuen.
+    static func load(_ handler: @escaping @MainActor ([InstalledApp]) -> Void) {
+        let hadApps = !apps.isEmpty
+        if hadApps { handler(apps) }
+        waiting.append { new in
+            if !hadApps || new.map(\.url) != Self.apps.map(\.url) { handler(new) }
+        }
+        guard !scanning else { return }
+        scanning = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = AppCatalog.scan()
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    let handlers = AppCatalog.waiting
+                    AppCatalog.waiting = []
+                    AppCatalog.scanning = false
+                    handlers.forEach { $0(result) }
+                    AppCatalog.apps = result
+                }
+            }
+        }
+    }
+
+    /// App-Icon (zwischengespeichert).
+    static func icon(for url: URL) -> NSImage {
+        if let icon = icons[url] { return icon }
+        let icon = NSWorkspace.shared.icon(forFile: url.path)
+        icon.size = NSSize(width: 56, height: 56)
+        icons[url] = icon
+        return icon
+    }
+
+    nonisolated private static func scan() -> [InstalledApp] {
+        let fm = FileManager.default
+        let home = fm.homeDirectoryForCurrentUser
+        let roots = ["/Applications", "/Applications/Utilities", "/System/Applications",
+                     "/System/Applications/Utilities", home.appendingPathComponent("Applications").path]
+        var seen = Set<String>()
+        var result: [InstalledApp] = []
+
+        func add(_ url: URL) {
+            let id = Bundle(url: url)?.bundleIdentifier
+            let key = id ?? url.path
+            guard !seen.contains(key) else { return }
+            seen.insert(key)
+            let name = fm.displayName(atPath: url.path).replacingOccurrences(of: ".app", with: "")
+            result.append(InstalledApp(url: url, name: name, bundleID: id))
+        }
+
+        for root in roots {
+            let rootURL = URL(fileURLWithPath: root)
+            guard let items = try? fm.contentsOfDirectory(at: rootURL, includingPropertiesForKeys: [.isDirectoryKey],
+                                                          options: [.skipsHiddenFiles]) else { continue }
+            for item in items {
+                if item.pathExtension == "app" {
+                    add(item)
+                } else if (try? item.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true,
+                          item.lastPathComponent != "Utilities" {
+                    // Eine Ebene tiefer, z.B. /Applications/Adobe Photoshop/…app
+                    let sub = (try? fm.contentsOfDirectory(at: item, includingPropertiesForKeys: nil,
+                                                           options: [.skipsHiddenFiles])) ?? []
+                    sub.filter { $0.pathExtension == "app" }.forEach(add)
+                }
+            }
+        }
+        // Kagami selbst (jede Kopie) nicht anbieten.
+        result.removeAll { SingleInstance.isKagami(bundleID: $0.bundleID) || $0.url.lastPathComponent == "Kagami.app" }
+        return result.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+}
+
 /// Startbildschirm im Overlay: alle installierten Apps mit Suche – ein Klick startet die App
 /// direkt auf dem Kagami-Bildschirm (bzw. holt sie hinein, wenn sie schon läuft).
 @MainActor
@@ -91,15 +172,13 @@ final class LauncherView: NSView, NSSearchFieldDelegate {
     override func mouseDown(with event: NSEvent) {}
     override func rightMouseDown(with event: NSEvent) {}
 
-    /// Liste neu einlesen (laufende Apps markieren) und Suche zurücksetzen.
+    /// Liste aktualisieren (laufende Apps markieren) und Suche zurücksetzen.
     func reload() {
-        allApps = Self.scanInstalledApps()
         searchField.stringValue = ""
-        applyFilter()
-    }
-
-    func focusSearch() {
-        window?.makeFirstResponder(searchField)
+        AppCatalog.load { [weak self] apps in
+            self?.allApps = apps
+            self?.applyFilter()
+        }
     }
 
     @objc private func closeTapped() { onClose?() }
@@ -134,62 +213,15 @@ final class LauncherView: NSView, NSSearchFieldDelegate {
 
     // MARK: Drag & Drop
 
-    private func appURLs(from info: NSDraggingInfo) -> [URL] {
-        let urls = info.draggingPasteboard.readObjects(forClasses: [NSURL.self],
-                                                       options: [.urlReadingFileURLsOnly: true]) as? [URL] ?? []
-        return urls.filter { $0.pathExtension.lowercased() == "app" }
-    }
-
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
-        appURLs(from: sender).isEmpty ? [] : .link
+        sender.appURLs.isEmpty ? [] : .link
     }
 
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
-        let urls = appURLs(from: sender)
+        let urls = sender.appURLs
         guard !urls.isEmpty else { return false }
         onDropApps?(urls)
         return true
-    }
-
-    // MARK: Apps finden
-
-    static func scanInstalledApps() -> [InstalledApp] {
-        let fm = FileManager.default
-        let home = fm.homeDirectoryForCurrentUser
-        let roots = ["/Applications", "/Applications/Utilities", "/System/Applications",
-                     "/System/Applications/Utilities", home.appendingPathComponent("Applications").path]
-        var seen = Set<String>()
-        var result: [InstalledApp] = []
-
-        func add(_ url: URL) {
-            let bundle = Bundle(url: url)
-            let id = bundle?.bundleIdentifier
-            let key = id ?? url.path
-            guard !seen.contains(key) else { return }
-            seen.insert(key)
-            let name = fm.displayName(atPath: url.path).replacingOccurrences(of: ".app", with: "")
-            result.append(InstalledApp(url: url, name: name, bundleID: id))
-        }
-
-        for root in roots {
-            let rootURL = URL(fileURLWithPath: root)
-            guard let items = try? fm.contentsOfDirectory(at: rootURL, includingPropertiesForKeys: [.isDirectoryKey],
-                                                          options: [.skipsHiddenFiles]) else { continue }
-            for item in items {
-                if item.pathExtension == "app" {
-                    add(item)
-                } else if (try? item.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true,
-                          item.lastPathComponent != "Utilities" {
-                    // Eine Ebene tiefer, z.B. /Applications/Adobe Photoshop/…app
-                    let sub = (try? fm.contentsOfDirectory(at: item, includingPropertiesForKeys: nil,
-                                                           options: [.skipsHiddenFiles])) ?? []
-                    sub.filter { $0.pathExtension == "app" }.forEach(add)
-                }
-            }
-        }
-        // Kagami selbst (jede Kopie) nicht anbieten.
-        result.removeAll { SingleInstance.isKagami(bundleID: $0.bundleID) || $0.url.lastPathComponent == "Kagami.app" }
-        return result.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
 }
 
@@ -208,7 +240,11 @@ final class KeySearchField: NSSearchField {
 final class AppGridView: NSView {
     var onSelect: (@MainActor (InstalledApp) -> Void)?
     private(set) var apps: [InstalledApp] = []
+    /// Sichtbare Kacheln (in Reihenfolge).
     private var tiles: [AppTile] = []
+    /// Alle je erzeugten Kacheln – beim Tippen in der Suche werden sie nur ein-/ausgeblendet
+    /// statt jedes Mal neu gebaut.
+    private var tileCache: [URL: AppTile] = [:]
 
     private let tileSize = CGSize(width: 96, height: 98)
     private let spacing: CGFloat = 6
@@ -222,17 +258,24 @@ final class AppGridView: NSView {
 
     func set(apps: [InstalledApp], running: Set<String>) {
         self.apps = apps
-        hoveredTile = nil
-        tiles.forEach { $0.removeFromSuperview() }
+        setHovered(nil)
+        tiles.forEach { $0.isHidden = true }
         tiles = apps.map { app in
-            let tile = AppTile(app: app, isRunning: app.bundleID.map(running.contains) ?? false)
-            tile.onClick = { [weak self] in self?.onSelect?(app) }
-            addSubview(tile)
+            let tile = tileCache[app.url] ?? makeTile(for: app)
+            tile.isRunning = app.bundleID.map(running.contains) ?? false
+            tile.isHidden = false
             return tile
         }
-        needsLayout = true
         relayout()
         updateHover()
+    }
+
+    private func makeTile(for app: InstalledApp) -> AppTile {
+        let tile = AppTile(app: app)
+        tile.onClick = { [weak self] in self?.onSelect?(app) }
+        addSubview(tile)
+        tileCache[app.url] = tile
+        return tile
     }
 
     // MARK: Hover – genau eine Kachel unter dem Mauszeiger
@@ -313,6 +356,7 @@ final class AppGridView: NSView {
 @MainActor
 final class AppTile: NSView {
     var onClick: (@MainActor () -> Void)?
+    private let name: String
     private let imageView = NSImageView()
     private let label = NSTextField(labelWithString: "")
     private let runningDot = NSView()
@@ -321,15 +365,22 @@ final class AppTile: NSView {
         didSet { layer?.backgroundColor = highlighted ? NSColor(white: 1, alpha: 0.12).cgColor : nil }
     }
 
-    init(app: InstalledApp, isRunning: Bool) {
+    /// Punkt unter dem Namen + Tooltip für „läuft bereits“.
+    var isRunning = false {
+        didSet {
+            runningDot.isHidden = !isRunning
+            toolTip = isRunning ? "\(name) – läuft bereits, wird hineingeholt" : name
+        }
+    }
+
+    init(app: InstalledApp) {
+        name = app.name
         super.init(frame: .zero)
         wantsLayer = true
         layer?.cornerRadius = 10
-        toolTip = isRunning ? "\(app.name) – läuft bereits, wird hineingeholt" : app.name
+        toolTip = name
 
-        let icon = NSWorkspace.shared.icon(forFile: app.url.path)
-        icon.size = NSSize(width: 56, height: 56)
-        imageView.image = icon
+        imageView.image = AppCatalog.icon(for: app.url)
         imageView.imageScaling = .scaleProportionallyUpOrDown
         imageView.frame = CGRect(x: 20, y: 6, width: 56, height: 56)
         addSubview(imageView)
@@ -346,7 +397,7 @@ final class AppTile: NSView {
         runningDot.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.8).cgColor
         runningDot.layer?.cornerRadius = 2
         runningDot.frame = CGRect(x: 46, y: 86, width: 4, height: 4)
-        runningDot.isHidden = !isRunning
+        runningDot.isHidden = true
         addSubview(runningDot)
     }
 

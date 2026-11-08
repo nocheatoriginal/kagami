@@ -28,8 +28,19 @@ extension AXHelpers {
         return id
     }
 
+    private static let scanQueue = DispatchQueue(label: "kagami.ax-scan", qos: .userInitiated)
+
     /// Alle Fenster einer App – auch die auf anderen Spaces und im Vollbild.
-    static func windowsOnAllSpaces(pid: pid_t) -> [AXUIElement] {
+    /// Die Suche kann einige hundert ms dauern und läuft deshalb im Hintergrund;
+    /// `completion` kommt auf dem Main-Thread.
+    static func windowsOnAllSpaces(pid: pid_t, completion: @escaping @MainActor ([AXUIElement]) -> Void) {
+        scanQueue.async {
+            let result = AXHelpers.windowsOnAllSpaces(pid: pid)
+            DispatchQueue.main.async { MainActor.assumeIsolated { completion(result) } }
+        }
+    }
+
+    private static func windowsOnAllSpaces(pid: pid_t) -> [AXUIElement] {
         var result = windows(pid: pid)
         var known = Set(result.map(windowID).filter { $0 != 0 })
         guard let createWithRemoteToken = Self.createWithRemoteToken else { return result }
